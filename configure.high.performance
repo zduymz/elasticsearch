@@ -1,0 +1,142 @@
+from: https://www.loggly.com/blog/nine-tips-configuring-elasticsearch-for-high-performance/
+
+Tip #1: Know Your Deployment Topology Before You Set Configs
+Loggly is running ES 0.90.13 with separate master and data nodes. We won’t be going into too much detail about that right now (look out for a subsequent post), other than to say that you need to determine your deployment topology in order to make the right configuration decisions.
+
+In addition, we use the ES node client to talk to data nodes. This makes the client transparent to data nodes; all it cares about is talking to node client. You establish your ES nodes as data and master using two properties that are set as true or false. For example, to make an Elasticsearch a data node, you set:
+
+node.master: false and node.data: true
+
+So that was the easy part. Now we’ll talk about some advanced ES properties that deserve your attention. Their default settings are sufficient for most deployments, but if your ES use cases are anywhere near as tough as those we see with log management, you’ll get a lot of benefit from the advice below.
+
+Tip #2: mlockall Offers the Biggest Bang for the Performance Efficiency Buck
+Linux divides its physical RAM into chunks of memory called pages. Swapping is the process whereby a page of memory is copied to the preconfigured space on the hard disk, called swap space, to free up that page of memory. The combined sizes of the physical memory and the swap space is the amount of virtual memory available.
+
+Swapping does have a downside. Compared to memory, disks are very slow. Memory speeds can be measured in nanoseconds, while disks are measured in milliseconds; so accessing the disk can be tens of thousands times slower than accessing physical memory. The more swapping that occurs, the slower your process will be, so you should avoid swapping at all cost.
+
+The mlockall property in ES allows the ES node not to swap its memory. (Note that it is available only for Linux/Unix systems.) This property can be set in the yaml file by doing the following.
+
+bootstrap.mlockall: true
+
+mlockall is set to false by default, meaning that the ES node will allow swapping. Once you add this value to the property file, you need to restart your ES node. You can verify if the value is set properly or not by doing the following:
+
+curl http://localhost:9200/_nodes/process?pretty
+
+if you are setting this property, make sure you are giving enough memory to the ES node using the -DXmx option or ES_HEAP_SIZE.
+
+Tip #3: discovery.zen properties control the discovery protocol for ElasticSearch
+Zen discovery is the protocol is used by ElasticSearch to discover and communicate between the nodes in the cluster. The zen discovery setting is controlled by the discovery.zen.* properties. Both unicast and multicast are available as part of discovery protocol:
+
+Multicast is when nodes in a cluster are discovered by sending one or more multicast requests to all the nodes.
+Unicast is a one-to one connection between the nodes and the list of IP addresses specified under the discovery.zen.ping.unicast.hosts.
+In order to enable unicast, you set discovery.zen.ping.multicast.enabled to false.
+
+For unicast, you also must specify the group of hosts that is used to communicate for discovery. This is done using the property discovery.zen.ping.unicast.hosts, which contains the master hosts which unicast can use to communicate.
+
+The discovery.zen.minimum_master_nodes control the minimum number of eligible master nodes that a node should “see” in order to operate within the cluster. It’s recommended that you set it to a higher value than 1 when running more than 2 nodes in the cluster. One way to calculate value for this will be N/2 + 1 where N is the number of master nodes.
+
+Data and master nodes detect each other in two different ways:
+
+By the master pinging all other nodes in the cluster and verify they are up and running
+By all other nodes pinging the master nodes to verify if they are up and running or if an election process needs to be initiated
+The node detection process is controlled by discover.zen.fd.ping_timeout property. The default value is 30s, which determines how long the node will wait for a response. This property should be adjusted if you are operating on a slow or congested network. If you are on slow network, set the value higher. The higher the value, the smaller the chance of discovery failure.
+
+Loggly has configured our discovery.zen properties as follows:
+
+discovery.zen.fd.ping_timeout: 30s
+
+discovery.zen.minimum_master_nodes: 2
+
+discovery.zen.ping.multicast.enabled: false
+
+discovery.zen.ping.unicast.hosts: [“esmaster01″,”esmaster02″,”esmaster03″]
+
+The above properties say that node detection should happen within 30 seconds; this is done by setting discovery.zen.fd.ping_timeout. In addition, two minimum master nodes should be detected by other nodes (we have 3 masters). This discovery method used is unicast and the unicast hosts are esmaster01, esmaster02, esmaster03.
+
+Tip #4: Watch Out for delete_all_indices!
+It’s really important to know that the curl API in ES does not have very good authentication built into it. A simple curl API can cause all the indices to delete themselves and lose all data. This is just one example of a command that could cause a mistaken deletion:
+
+curl -XDELETE ‘http://localhost:9200/*/’
+
+To avoid this type of grief, you can set the following property:
+
+action.disable_delete_all_indices: true.
+
+This will make sure when above command is given, it will not delete the index and will instead result in an error.
+
+Tip #5: Field Data Caching Can Cause Extremely Slow Facet Searches
+This is how the ElasticSearch help describes the field data cache:
+
+The field data cache is used mainly when sorting on or faceting on a field. It loads all the field values to memory in order to provide fast document based access to those values. The field data cache can be expensive to build for a field, so its recommended to have enough memory to allocate it, and to keep it loaded.
+
+You need to keep in mind that not setting this value properly can cause:
+
+Facet searches and sorting to have very poor performance
+The ES node to run out of memory if you run the facet query against a large index
+An example:
+
+indices.fielddata.cache.size: 25%
+
+In setting this value, the key consideration is what kind of facet searches your application performs.
+
+Tip #6: Optimizing Index Requests
+At Loggly, we built our own index management system since the nature of log management means that we have frequent updates and mapping changes. This index manager’s responsibility is to manage indices on our ES cluster. It detects when the index needs to be created or closed based on the configured policies. There are many policies in the index manager. For example, if the index grows beyond a certain size or lives for more than a certain time, the index manager will close the index and create a new one.
+
+When the index manager send a node an index request to process, the node updates its own mapping and then sends that mapping to the master. While the master processes it, that node receives a state that includes an older version of the mapping. If there’s a conflict, it’s not bad (i.e. the cluster state will eventually have the correct mapping), but we send a refresh just in case from that node to the master. In order to make the index request more efficient, we have set this property on our data nodes.
+
+indices.cluster.send_refresh_mapping: false
+
+Sending refresh mapping is more important when the reverse happens, and for some reason, the mapping in the master is ahead (or in conflict) with the actual parsing of it in the actual node on which the index exists. In this case, the refresh mapping will result in a warning being logged on the master node.
+
+Tip #7: Navigating ElasticSearch’s Allocation-related Properties
+Shard allocation is the process of allocating shards to nodes. This can happen during initial recovery, replica allocation, or rebalancing. Or it can happen when handling nodes that are being added or removed.
+
+The cluster.routing.allocation.cluster_concurrent_rebalance property determines the number of shards allowed for concurrent rebalance. This property needs to be set appropriately depending on the hardware being used, for example the number of CPUs, IO capacity, etc. If this property is not set appropriately, it can impact the ElasticSearch performance with indexing.
+
+cluster.routing.allocation.cluster_concurrent_rebalance:2
+
+By default the value is set at 2, meaning that at any point in time only 2 shards are allowed to be moving. It is good to set this property low so that the rebalance of shards is throttled and doesn’t affect indexing.
+
+The other shard allocation property is cluster.routing.allocation.disk.threshold_enabled. If this property is set to true, the shard allocation will take free disk space into account while allocating shards to a node.
+
+When enabled (i.e when it is set to true), the shard allocation takes two watermark properties into account: low and high.
+
+The low watermark dictates the disk usage point that which ES won’t allocate new shards. In the example below, ES stops allocating shards for a node once disk usage reaches 97%.
+The high watermark dedicates the disk usage value at which the shards will start moving out of the node (99% in the example below).
+cluster.routing.allocation.disk.threshold_enabled:true
+
+cluster.routing.allocation.disk.watermark.low:.97
+
+cluster.routing.allocation.disk.watermark.high:.99
+
+Tip #8: Recovery Properties Allow for Faster Restart Times
+ES includes several recovery properties which improve both ElasticSearch cluster recovery and restart times. We have shown some sample values below. The value that will work best for you depends on the hardware you have in use, and the best advice we can give is to test, test, and test again.
+
+cluster.routing.allocation.node_concurrent_recoveries:4
+
+This property is how many shards per node are allowed for recovery at any moment in time. Recovering shards is a very IO-intensive operation, so you should set this value with real caution.
+
+cluster.routing.allocation.node_initial_primaries_recoveries:18
+
+This controls the number of primary shards initialized concurrently on a single node. The number of parallel stream of data transfer from node to recover shard from peer node is controlled by indices.recovery.concurrent_streams. The value below is setup for the Amazon instance, but if you have your own hardware you might be able to set this value much higher. The property max_bytes_per_sec (as its name suggests) determines how many bytes to transfer per second. This value again need to be configured according to your hardware.
+
+indices.recovery.concurrent_streams: 4
+
+indices.recovery.max_bytes_per_sec: 40mb
+
+All of the properties described above get used only when the cluster is restarted.
+
+Tip #9: Threadpool Properties Prevent Data Loss
+ElasticSearch node has several thread pools in order to improve how threads are managed within a node. At Loggly, we use bulk request extensively, and we have found that  setting the right value for bulk thread pool using threadpool.bulk.queue_size property is crucial in order to avoid data loss or _bulk retries
+
+threadpool.bulk.queue_size: 3000
+
+This property value is for the bulk request. This tells ES the number of  requests that can be queued for execution in the node when there is no thread available to execute a bulk request. This value should be set according to your bulk request load. If your bulk request number goes higher than queue size, you will get a RemoteTransportException as shown below.
+
+Note that in ES the bulk requests queue contains one item per shard, so this number needs to be higher than the number of concurrent bulk requests you want to send if those request contain data for many shards. For example, a single bulk request may contain data for 10 shards, so even if you only send one bulk request, you must have a queue size of at least 10. Setting this value “too high” will chew up heap in your JVM, but does let you hand off queuing to ES, which simplifies your clients.
+
+You either need to keep the property value higher than your accepted load or gracefully handle RemoteTransportException in your client code. If you don’t handle the exception, you will  end up losing data. We simulated the exception shown below by sending more than 10 bulk requests with a queue size of 10.
+
+RemoteTransportException[[<Bantam>][inet[/192.168.76.1:9300]][bulk/shard]]; nested: EsRejectedExecutionException[rejected execution (queue capacity 10) on org.elasticsearch.action.support.replication.TransportShardReplicationOperationAction$AsyncShardOperationAction$1@13fe9be];
+
+
